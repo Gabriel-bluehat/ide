@@ -5,20 +5,21 @@ pub mod example;
 use crate::prelude::*;
 
 use crate::double_representation::module::QualifiedName;
+use crate::double_representation::tp;
 use crate::model::module::MethodId;
 use crate::model::suggestion_database::entry::Kind;
 use crate::notification;
 
 use data::text::TextLocation;
 use enso_protocol::language_server;
-use enso_protocol::language_server::SuggestionId;
+use enso_protocol::language_server::{SuggestionId, SuggestionsDatabaseModification};
 use flo_stream::Subscriber;
-use language_server::types::SuggestionsDatabaseVersion;
 use language_server::types::SuggestionDatabaseUpdatesEvent;
+use language_server::types::SuggestionsDatabaseVersion;
 
 pub use entry::Entry;
 pub use example::Example;
-
+use crate::controller::searcher::action::Suggestion;
 
 
 // ==============
@@ -43,7 +44,157 @@ pub enum Notification {
     Updated
 }
 
+#[derive(Debug)]
+struct DataStore {
+    storage: HashMap<entry::Id,Rc<Entry>>,
+}
 
+/// Indicates that updating a suggestion failed.
+#[derive(Debug)]
+pub enum UpdateError {
+    /// There was no entry with the given ID in the data store.
+    InvalidEntry(entry::Id),
+    /// There was an issue applying one of the modification. For every issue an error is returned.
+    UpdateFailures(Vec<failure::Error>)
+}
+
+pub struct ModuleDocumentation {
+    module : Rc<Entry>,
+    atoms  : Vec<AtomDocs>
+}
+
+pub struct AtomDocs {
+    atom     : Rc<Entry>,
+    methods : Vec<Rc<Entry>>,
+}
+
+impl From<AtomDocs> for Documentation {
+    fn from(docs: AtomDocs) -> Self {
+        let mut output = docs.atom.documentation_html.clone().unwrap_or_default();
+        for doc in &docs.methods {
+            output.extend(doc.documentation_html.clone().unwrap_or_default().chars());
+        }
+        output
+    }
+}
+impl From<ModuleDocumentation> for Documentation {
+    fn from(docs: ModuleDocumentation) -> Self {
+        let mut output = docs.module.documentation_html.clone().unwrap_or_default();
+        output.extend(docs.atoms.into_iter().map_into::<Documentation>());
+        output
+    }
+}
+
+
+impl DataStore {
+    fn new() -> DataStore {
+        let storage = default();
+        DataStore{storage}
+    }
+
+
+    fn from_entries(entries:impl IntoIterator<Item=(SuggestionId, Entry)>) -> DataStore {
+        let mut data_store = Self::new();
+        let entries = entries.into_iter().map(|(id,entry)| (id,Rc::new(entry)));
+        data_store.storage.extend(entries);
+        data_store
+    }
+
+    fn insert_entries<'a>(&mut self, entries:impl IntoIterator<Item=(&'a SuggestionId,&'a Entry)>) {
+        entries.into_iter().for_each(|item| self.insert_entry(item))
+    }
+
+    fn insert_entry(&mut self, entry:(&SuggestionId,&Entry)) {
+        self.storage.insert(*entry.0,Rc::new(entry.1.clone()));
+    }
+
+    fn remove_entry(&mut self, id:SuggestionId) -> Option<Rc<Entry>> {
+        self.storage.remove(&id)
+    }
+
+    fn update_entry(&mut self, id: entry::Id, modification:SuggestionsDatabaseModification) -> Result<(),UpdateError>{
+        if let Some(old_entry) = self.storage.get_mut(&id) {
+            let entry  = Rc::make_mut(old_entry);
+            let errors = entry.apply_modifications(modification);
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(UpdateError::UpdateFailures(errors))
+            }
+        } else {
+            Err(UpdateError::InvalidEntry(id))
+        }
+    }
+
+    fn get_entry(&self, id: entry::Id) -> Option<Rc<Entry>> {
+        self.storage.get(&id).cloned()
+    }
+
+    fn get_method(&self, id:MethodId) -> Option<Rc<Entry>>{
+        self.storage.values().find(|entry| entry.method_id().contains(&id)).cloned()
+    }
+
+    fn get_entry_by_name_and_location(&self, name:impl Str, module:&QualifiedName, location:TextLocation) -> Vec<Rc<Entry>>{
+        self.storage.values().filter(|entry| {
+            entry.matches_name(name.as_ref()) && entry.is_visible_at(module,location)
+        }).cloned().collect()
+    }
+
+    fn get_locals_by_name_and_location(&self, name:impl Str, module:&QualifiedName, location:TextLocation) -> Vec<Rc<Entry>>{
+        self.storage.values().filter(|entry| {
+            let is_local = entry.kind == Kind::Function || entry.kind == Kind::Local;
+            is_local && entry.matches_name(name.as_ref()) && entry.is_visible_at(module,location)
+        }).cloned().collect()
+    }
+
+    fn get_module_method(&self, name:impl Str, module:&QualifiedName) ->Option<Rc<Entry>> {
+        self.storage.values().find(|entry| {
+            let is_method             = entry.kind == Kind::Method;
+            let is_defined_for_module = entry.has_self_type(module);
+            is_method && is_defined_for_module && entry.matches_name(name.as_ref())
+        }).cloned()
+    }
+
+    fn get_module_methods(&self, module:&QualifiedName) -> Vec<Rc<Entry>> {
+        self.storage.values().filter(|entry| {
+            let is_method             = entry.kind == Kind::Method;
+            let is_defined_for_module = entry.has_self_type(module);
+            is_method && is_defined_for_module
+        }).cloned().collect()
+    }
+
+    fn get_module_atoms(&self, module:&QualifiedName) -> Vec<Rc<Entry>> {
+        self.storage.values().filter(|entry| {
+            let is_method             = entry.kind == Kind::Atom;
+            let is_defined_for_module = entry.module == *module;
+            is_method && is_defined_for_module
+        }).cloned().collect()
+    }
+
+    fn get_module(&self, module:&QualifiedName) -> Option<Rc<Entry>> {
+        self.storage.values().find(|entry| {
+            let is_method             = entry.kind == Kind::Module;
+            let is_defined_for_module = entry.module == *module;
+            is_method && is_defined_for_module
+        }).cloned()
+    }
+
+    fn get_atom(&self, name:&tp::QualifiedName) -> Option<Rc<Entry>> {
+        self.storage.values().find(|entry| {
+            let is_method     = entry.kind == Kind::Atom;
+            let matches_name = entry.qualified_name() == *name;
+            is_method && matches_name
+        }).cloned()
+    }
+
+    fn get_methods_for_type(&self, tp:&tp::QualifiedName) -> Vec<Rc<Entry>> {
+        self.storage.values().filter(|entry| {
+            let is_method             = entry.kind == Kind::Method;
+            let is_defined_for_type   = entry.has_self_type(tp);
+            is_method && is_defined_for_type
+        }).cloned().collect()
+    }
+}
 
 // ================
 // === Database ===
@@ -55,32 +206,33 @@ pub enum Notification {
 /// often-called Language Server methods returns the list of keys of this database instead of the
 /// whole entries. Additionally the suggestions contains information about functions and their
 /// argument names and types.
-#[derive(Clone,Debug)]
+#[derive(Debug)]
 pub struct SuggestionDatabase {
     logger        : Logger,
-    entries       : RefCell<HashMap<entry::Id,Rc<Entry>>>,
+    entries       : RefCell<DataStore>,
     examples      : RefCell<Vec<Rc<Example>>>,
     version       : Cell<SuggestionsDatabaseVersion>,
     notifications : notification::Publisher<Notification>,
 }
 
 impl SuggestionDatabase {
-    /// Create a database with no entries.
+       /// Create a database with no entries.
     pub fn new_empty(logger:impl AnyLogger) -> Self {
         let logger        = Logger::new_sub(logger,"SuggestionDatabase");
-        let entries       = default();
+        let entries       = RefCell::new(DataStore::new());
         let examples      = default();
         let version       = default();
         let notifications = default();
         Self {logger,entries,examples,version,notifications}
     }
 
+
     /// Create a database filled with entries provided by the given iterator.
     pub fn new_from_entries<'a>
     (logger:impl AnyLogger, entries:impl IntoIterator<Item=(&'a SuggestionId,&'a Entry)>) -> Self {
         let ret     = Self::new_empty(logger);
-        let entries = entries.into_iter().map(|(id,entry)| (*id,Rc::new(entry.clone())));
-        ret.entries.borrow_mut().extend(entries);
+        // let entries = entries.into_iter().map(|(id,entry)| (*id,Rc::new(entry.clone())));
+        ret.entries.borrow_mut().insert_entries(entries);
         ret
     }
 
@@ -94,14 +246,23 @@ impl SuggestionDatabase {
     /// Create a new database model from response received from the Language Server.
     fn from_ls_response(response:language_server::response::GetSuggestionDatabase) -> Self {
         let logger      = Logger::new("SuggestionDatabase");
-        let mut entries = HashMap::new();
-        for ls_entry in response.entries {
+
+        let ls_entries =  response.entries.into_iter().filter_map(|ls_entry| {
             let id = ls_entry.id;
             match Entry::from_ls_entry(ls_entry.suggestion) {
-                Ok(entry) => { entries.insert(id, Rc::new(entry)); },
-                Err(err)  => { error!(logger,"Discarded invalid entry {id}: {err}"); },
+                Ok(entry) => { Some((id, entry)) },
+                Err(err)  => { error!(logger,"Discarded invalid entry {id}: {err}"); None },
             }
-        }
+        });
+        let entries = DataStore::from_entries(ls_entries);
+        // let mut entries = HashMap::new();
+        // for ls_entry in response.entries {
+        //     let id = ls_entry.id;
+        //     match Entry::from_ls_entry(ls_entry.suggestion) {
+        //         Ok(entry) => { entries.insert(id, Rc::new(entry)); },
+        //         Err(err)  => { error!(logger,"Discarded invalid entry {id}: {err}"); },
+        //     }
+        // }
         //TODO[ao]: This is a temporary solution. Eventually, we should gather examples from the
         //          available modules documentation. (https://github.com/enso-org/ide/issues/1011)
         let examples = example::EXAMPLES.iter().cloned().map(Rc::new).collect_vec();
@@ -121,7 +282,7 @@ impl SuggestionDatabase {
 
     /// Get suggestion entry by id.
     pub fn lookup(&self, id:entry::Id) -> Result<Rc<Entry>,NoSuchEntry> {
-        self.entries.borrow().get(&id).cloned().ok_or(NoSuchEntry(id))
+        self.entries.borrow().get_entry(id).ok_or(NoSuchEntry(id))
     }
 
     /// Apply the update event to the database.
@@ -130,27 +291,21 @@ impl SuggestionDatabase {
             let mut entries = self.entries.borrow_mut();
             match update {
                 entry::Update::Add {id,suggestion} => match suggestion.try_into() {
-                    Ok(entry) => { entries.insert(id,Rc::new(entry));                       },
+                    Ok(entry) => { entries.insert_entry((&id,&entry));                       },
                     Err(err)  => { error!(self.logger, "Discarding update for {id}: {err}") },
                 },
                 entry::Update::Remove {id} => {
-                    let removed = entries.remove(&id);
+                    let removed = entries.remove_entry(id);
                     if removed.is_none() {
                         error!(self.logger, "Received Remove event for nonexistent id: {id}");
                     }
                 },
                 entry::Update::Modify
                     {id,modification,..} => {
-                    if let Some(old_entry) = entries.get_mut(&id) {
-                        let entry  = Rc::make_mut(old_entry);
-                        let errors = entry.apply_modifications(*modification);
-                        for error in errors {
-                            error!(self.logger
-                                ,"Error when applying update for entry {id}: {error:?}");
-                        }
-                    } else {
-                        error!(self.logger, "Received Modify event for nonexistent id: {id}");
+                    if let Err(err) = entries.update_entry(id,*modification) {
+                        error!(self.logger, || format!("Suggestion entry update failed: {:?}", err));
                     }
+
                 }
             };
         }
@@ -169,35 +324,26 @@ impl SuggestionDatabase {
 
     /// Search the database for an entry of method identified by given id.
     pub fn lookup_method(&self, id:MethodId) -> Option<Rc<Entry>> {
-        self.entries.borrow().values().cloned().find(|entry| entry.method_id().contains(&id))
+        self.entries.borrow().get_method(id)
     }
 
     /// Search the database for entries with given name and visible at given location in module.
     pub fn lookup_by_name_and_location
     (&self, name:impl Str, module:&QualifiedName, location:TextLocation) -> Vec<Rc<Entry>> {
-        self.entries.borrow().values().filter(|entry| {
-            entry.matches_name(name.as_ref()) && entry.is_visible_at(module,location)
-        }).cloned().collect()
+        self.entries.borrow().get_entry_by_name_and_location(name,module,location)
     }
 
     /// Search the database for Local or Function entries with given name and visible at given
     /// location in module.
     pub fn lookup_locals_by_name_and_location
     (&self, name:impl Str, module:&QualifiedName, location:TextLocation) -> Vec<Rc<Entry>> {
-        self.entries.borrow().values().cloned().filter(|entry| {
-            let is_local = entry.kind == Kind::Function || entry.kind == Kind::Local;
-            is_local && entry.matches_name(name.as_ref()) && entry.is_visible_at(module,location)
-        }).collect()
+        self.entries.borrow().get_locals_by_name_and_location(name,module,location)
     }
 
     /// Search the database for Method entry with given name and defined for given module.
     pub fn lookup_module_method
     (&self, name:impl Str, module:&QualifiedName) -> Option<Rc<Entry>> {
-        self.entries.borrow().values().cloned().find(|entry| {
-            let is_method             = entry.kind == Kind::Method;
-            let is_defined_for_module = entry.has_self_type(module);
-            is_method && is_defined_for_module && entry.matches_name(name.as_ref())
-        })
+        self.entries.borrow().get_module_method(name,module)
     }
 
     /// An iterator over all examples gathered from suggestions.
@@ -213,9 +359,52 @@ impl SuggestionDatabase {
     /// Language Server and IDE, and should be used only in tests.
     #[cfg(test)]
     pub fn put_entry(&self, id:entry::Id, entry:Entry) {
-        self.entries.borrow_mut().insert(id,Rc::new(entry));
+        self.entries.borrow_mut().insert_entry((&id,&entry))
+    }
+
+    fn get_atom_docs(&self, tp:&tp::QualifiedName) -> Option<AtomDocs> {
+        let atom = self.entries.borrow().get_atom(tp)?;
+        let methods = self.entries.borrow().get_methods_for_type(tp);
+        Some(AtomDocs{atom,methods})
+    }
+
+    pub fn get_module_doc(&self, module:&QualifiedName) -> Option<ModuleDocumentation> {
+        let module_entry = self.entries.borrow().get_module(module)?;
+        let module_atom_entries = self.entries.borrow().get_module_atoms(module);
+        let atom_types = module_atom_entries.iter().filter_map(|entry| entry.self_type.clone());
+        let atom_docs = atom_types.filter_map(|atom_type| self.get_atom_docs(&atom_type)).collect();
+        Some(ModuleDocumentation {module:module_entry,atoms:atom_docs})
+    }
+
+    pub fn get_documentation(&self, id:entry::Id) -> Option<Documentation> {
+        let entry = self.lookup(id).ok()?;
+        self.get_documentation_for_entry(&entry)
+
+    }
+
+    pub fn get_documentation_for_entry(&self, entry:&Entry) -> Option<Documentation> {
+        DEBUG!("{entry:#?}");
+        let docs = match entry.kind {
+            Kind::Atom   => {  Some(self.get_atom_docs(&entry.qualified_name())?.into()) }
+            Kind::Module => {  Some(self.get_module_doc(&entry.module)?.into())}
+            _            => entry.documentation_html.clone()
+        };
+        match docs {
+            Some(s) if s.is_empty() => None,
+            _                       => docs
+        }
+    }
+
+    pub fn get_documentation_for_suggestion(&self, suggestion:&Suggestion) -> Option<Documentation> {
+        match suggestion {
+            Suggestion::FromDatabase(entry)   => self.get_documentation_for_entry(entry),
+            Suggestion::Hardcoded(suggestion) => suggestion.documentation_html.map_ref(|doc| doc.to_string()),
+        }
     }
 }
+
+
+pub type Documentation = String;
 
 impl From<language_server::response::GetSuggestionDatabase> for SuggestionDatabase {
     fn from(database:language_server::response::GetSuggestionDatabase) -> Self {
