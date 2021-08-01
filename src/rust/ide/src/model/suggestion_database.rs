@@ -60,7 +60,8 @@ pub enum UpdateError {
 
 pub struct ModuleDocumentation {
     module : Rc<Entry>,
-    atoms  : Vec<AtomDocs>
+    atoms  : Vec<AtomDocs>,
+    others : Vec<Rc<Entry>>,
 }
 
 pub struct AtomDocs {
@@ -68,20 +69,60 @@ pub struct AtomDocs {
     methods : Vec<Rc<Entry>>,
 }
 
-impl From<AtomDocs> for Documentation {
-    fn from(docs: AtomDocs) -> Self {
-        let mut output = docs.atom.documentation_html.clone().unwrap_or_default();
-        for doc in &docs.methods {
-            output.extend(doc.documentation_html.clone().unwrap_or_default().chars());
-        }
-        output
+fn in_doc_container(s:String) -> String {
+    format!("<div class=\"doc\" style=\"font-size:13p;\">{}</div>",s)
+}
+
+fn in_atoms_section_container(s:String) -> String {
+    if s.is_empty() {
+        s
+    } else {
+        format!("<div class=\"separator\">Atoms</div>{}",s)
     }
 }
+
+fn in_methods_section_container(s:String) -> String {
+    if s.is_empty() {
+        s
+    } else {
+        format!("<div class=\"separator\">Methods</div>{}",s)
+    }
+}
+
+
+const NO_DOCS_PLACEHOLDER: &str = "<p style=\"color: #a3a6a9;\">No documentation available</p>";
+const NO_ATOMS_PLACEHOLDER: &str = "<p style=\"color: #a3a6a9;\">No atoms available</p>";
+const NO_METHODS_PLACEHOLDER: &str = "<p style=\"color: #a3a6a9;\">No methods available</p>";
+impl From<AtomDocs> for Documentation {
+    fn from(docs: AtomDocs) -> Self {
+        let mut output = format!("<p>{} - Atom</p>", docs.atom.name);
+        output.extend(docs.atom.documentation_html.clone().unwrap_or(NO_DOCS_PLACEHOLDER.to_string()).chars());
+        output.extend("<p>Atom Methods</p>".chars());
+        for doc in &docs.methods {
+            output.extend(format!("<hr><p>{}</p>", doc.name).chars());
+            output.extend(doc.documentation_html.clone().unwrap_or(NO_METHODS_PLACEHOLDER.to_string()).chars());
+        }
+        in_doc_container(output)
+    }
+}
+
+
+
 impl From<ModuleDocumentation> for Documentation {
     fn from(docs: ModuleDocumentation) -> Self {
-        let mut output = docs.module.documentation_html.clone().unwrap_or_default();
-        output.extend(docs.atoms.into_iter().map_into::<Documentation>());
-        output
+        let mut output = format!("<p>{} - Module</p>", docs.module.name);
+        output.extend(docs.module.documentation_html.clone().unwrap_or(NO_DOCS_PLACEHOLDER.to_string()).chars());
+        // output.extend("<p>Module Atoms</p>".chars());
+        let atom_doc:String = docs.atoms.into_iter().map_into::<Documentation>().collect();
+        output.extend(in_atoms_section_container(atom_doc).chars());
+        // output.extend("<p>Module Methods</p>".chars());
+        let methods:String = docs.others.into_iter().map(|entry| {
+            let heading = &entry.name;
+            let doc     = entry.documentation_html.clone().unwrap_or(NO_DOCS_PLACEHOLDER.to_string());
+            format!("<p>{}</p>{}",heading,doc)
+        }).collect();
+        output.extend(in_methods_section_container(methods).chars());
+        in_doc_container(output)
     }
 }
 
@@ -91,7 +132,6 @@ impl DataStore {
         let storage = default();
         DataStore{storage}
     }
-
 
     fn from_entries(entries:impl IntoIterator<Item=(SuggestionId, Entry)>) -> DataStore {
         let mut data_store = Self::new();
@@ -373,7 +413,8 @@ impl SuggestionDatabase {
         let module_atom_entries = self.entries.borrow().get_module_atoms(module);
         let atom_types = module_atom_entries.iter().filter_map(|entry| entry.self_type.clone());
         let atom_docs = atom_types.filter_map(|atom_type| self.get_atom_docs(&atom_type)).collect();
-        Some(ModuleDocumentation {module:module_entry,atoms:atom_docs})
+        let others = self.entries.borrow().get_module_methods(module);
+        Some(ModuleDocumentation {module:module_entry,atoms:atom_docs,others})
     }
 
     pub fn get_documentation(&self, id:entry::Id) -> Option<Documentation> {
